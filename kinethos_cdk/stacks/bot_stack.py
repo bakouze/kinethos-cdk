@@ -3,11 +3,13 @@ from __future__ import annotations
 from aws_cdk import (
     Stack,
     CfnOutput,
-    aws_logs as logs,
+    aws_iam as iam,
 )
 from constructs import Construct
 
 from kinethos_cdk.constructs.telegram_webhook import TelegramWebhook
+from kinethos_cdk.constructs.updates_storage import UpdatesStorage
+from kinethos_cdk.constructs.updates_table import UpdatesTable
 
 
 class BotStack(Stack):
@@ -47,7 +49,7 @@ class BotStack(Stack):
                 "webhook_secret is empty. Pass -c webhookSecret=... or set WEBHOOK_SECRET_TOKEN."
             )
 
-        # Reusable construct for Lambda + HTTP API
+        # 1) Webhook Lambda + API
         webhook = TelegramWebhook(
             self,
             "TelegramWebhook",
@@ -64,9 +66,29 @@ class BotStack(Stack):
         # if webhook.function.log_group is not None:
             # webhook.function.log_group.apply_removal_policy(self.removal_policy)  # inherit
             # webhook.function.log_group.set_retention(logs.RetentionDays.TWO_WEEKS)
+            
+        # 2) Storage: S3 + Firehose
+        storage = UpdatesStorage(self, "UpdatesStorage", bucket_prefix="raw/")
+        # Allow the Lambda to put records into Firehose
+        webhook.function.add_to_role_policy(iam.PolicyStatement(
+            actions=["firehose:PutRecord", "firehose:PutRecordBatch"],
+            resources=[f"arn:aws:firehose:{self.region}:{self.account}:deliverystream/{storage.delivery_stream_name}"],
+        ))
+
+        # 3) DynamoDB for operational queries
+        ddb = UpdatesTable(self, "UpdatesTable")
+        ddb.table.grant_write_data(webhook.function)  # PutItem
+
+        # 4) Pass names to the Lambda as env vars
+        webhook.function.add_environment("FIREHOSE_STREAM_NAME", storage.delivery_stream_name)
+        webhook.function.add_environment("DDB_TABLE_NAME", ddb.table.table_name)
+
 
         # Handy attribute for app.py to export
         self.webhook_url = webhook.webhook_url
 
         # Also output it directly from this stack
         CfnOutput(self, "WebhookUrl", value=self.webhook_url, description="Telegram webhook URL")
+        CfnOutput(self, "S3BucketName", value=storage.bucket.bucket_name)
+        CfnOutput(self, "FirehoseStreamName", value=storage.delivery_stream_name)
+        CfnOutput(self, "DynamoTableName", value=ddb.table.table_name)
