@@ -1,28 +1,44 @@
 #!/usr/bin/env python3
 import os
-
 import aws_cdk as cdk
 
-from kinethos_cdk.kinethos_cdk_stack import KinethosCdkStack
-
+# BotStack will host the Telegram webhook (HTTP API + Lambda)
+# Make sure you have kinethos_cdk/stacks/bot_stack.py implemented as discussed.
+from kinethos_cdk.stacks.bot_stack import BotStack
 
 app = cdk.App()
-KinethosCdkStack(app, "KinethosCdkStack",
-    # If you don't specify 'env', this stack will be environment-agnostic.
-    # Account/Region-dependent features and context lookups will not work,
-    # but a single synthesized template can be deployed anywhere.
 
-    # Uncomment the next line to specialize this stack for the AWS Account
-    # and Region that are implied by the current CLI configuration.
+# ----- Environment & Stage -----
+stage = app.node.try_get_context("stage") or os.getenv("STAGE", "dev")
 
-    #env=cdk.Environment(account=os.getenv('CDK_DEFAULT_ACCOUNT'), region=os.getenv('CDK_DEFAULT_REGION')),
+# Prefer CLI-provided account/region; fall back to explicit defaults
+account = os.getenv("CDK_DEFAULT_ACCOUNT") or "884551077777"
+region = os.getenv("CDK_DEFAULT_REGION") or "eu-central-1"
 
-    # Uncomment the next line if you know exactly what Account and Region you
-    # want to deploy the stack to. */
+env = cdk.Environment(account=account, region=region)
 
-    #env=cdk.Environment(account='123456789012', region='us-east-1'),
+# ----- Telegram Bot (webhook) stack -----
+# Secrets can be provided via CDK context (-c) or environment variables
+telegram_token = (
+    app.node.try_get_context("telegramToken")
+    or os.getenv("TELEGRAM_TOKEN")
+    or ""
+)
 
-    # For more information, see https://docs.aws.amazon.com/cdk/latest/guide/environments.html
-    )
+webhook_secret = (
+    app.node.try_get_context("webhookSecret")
+    or os.getenv("WEBHOOK_SECRET_TOKEN")
+    or ""
+)
+
+bot_stack = BotStack(
+    app,
+    f"KinethosBotStack-{stage}",
+    env=env,
+    telegram_token=telegram_token,
+    webhook_secret=webhook_secret,
+    lambda_code_path="kinethos_cdk/services/telegram_bot",  # folder containing lambda_function.py
+    webhook_path="/bot",
+)
 
 app.synth()

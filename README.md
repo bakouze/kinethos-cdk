@@ -1,58 +1,153 @@
+# Kinethos — Telegram Webhook (AWS CDK, Python)
 
-# Welcome to your CDK Python project!
+Minimal AWS infrastructure to run a Telegram bot via **webhook**:
+- **API Gateway (HTTP API)** receives Telegram updates.
+- **AWS Lambda (Python 3.11)** processes updates with `python-telegram-bot` v21.
 
-This is a blank project for CDK development with Python.
+> This repo is an MVP scaffold. It’s easy to extend with Bedrock calls, DynamoDB, etc.
 
-The `cdk.json` file tells the CDK Toolkit how to execute your app.
+---
 
-This project is set up like a standard Python project.  The initialization
-process also creates a virtualenv within this project, stored under the `.venv`
-directory.  To create the virtualenv it assumes that there is a `python3`
-(or `python` for Windows) executable in your path with access to the `venv`
-package. If for any reason the automatic creation of the virtualenv fails,
-you can create the virtualenv manually.
-
-To manually create a virtualenv on MacOS and Linux:
+## Architecture
 
 ```
-$ python3 -m venv .venv
+Telegram → HTTPS Webhook (API Gateway HTTP API) → Lambda → CloudWatch Logs
 ```
 
-After the init process completes and the virtualenv is created, you can use the following
-step to activate your virtualenv.
+- The Lambda handler caches a single `Application` instance and `initialize()` is called once per warm start.
 
+---
+
+## Prerequisites
+
+- Python 3.11 (for CDK and Lambda runtime)
+- Node.js + npm (for AWS CDK CLI)
+- AWS CLI configured (`aws configure`)
+- An existing Telegram **bot token** from @BotFather
+- **Docker installed locally** (required by CDK to bundle Python dependencies)
+
+---
+
+## Docker Requirement
+
+This project uses AWS CDK's bundling feature (e.g., `PythonFunction` or `BundlingOptions`) to package Python dependencies inside a Docker container automatically during deployment. 
+
+Ensure Docker is installed and running on your local machine before deploying. You can verify by running:
+
+```bash
+docker --version
 ```
-$ source .venv/bin/activate
+
+---
+
+## Install
+
+```bash
+# in the project root
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# Bootstrap the account/region once
+export AWS_REGION=eu-central-1
+cdk bootstrap aws://$AWS_ACCOUNT_ID/$AWS_REGION
 ```
 
-If you are a Windows platform, you would activate the virtualenv like this:
+---
 
-```
-% .venv\Scripts\activate.bat
-```
+## Deploy
 
-Once the virtualenv is activated, you can install the required dependencies.
+Choose a stage name (e.g., `dev`) and provide secrets via **CDK context** or **env vars**.
 
-```
-$ pip install -r requirements.txt
-```
+During deployment, CDK will use Docker to bundle the Lambda function and its dependencies automatically.
 
-At this point you can now synthesize the CloudFormation template for this code.
-
-```
-$ cdk synth
+```bash
+# Option: pass secrets via -c context
+cdk deploy KinethosBotStack-dev \
+  -c stage=dev \
+  -c telegramToken="YOUR_TELEGRAM_BOT_TOKEN" \
+  -c webhookSecret="a-long-random-secret"
 ```
 
-To add additional dependencies, for example other CDK libraries, just add
-them to your `setup.py` file and rerun the `pip install -r requirements.txt`
-command.
+This creates:
+- Lambda function (with dependencies bundled via Docker)
+- API Gateway HTTP API
 
-## Useful commands
+The stack outputs a `WebhookUrl` (e.g., `https://abc123.execute-api.eu-central-1.amazonaws.com/bot`).
 
- * `cdk ls`          list all stacks in the app
- * `cdk synth`       emits the synthesized CloudFormation template
- * `cdk deploy`      deploy this stack to your default AWS account/region
- * `cdk diff`        compare deployed stack with current state
- * `cdk docs`        open CDK documentation
+---
 
-Enjoy!
+## Set the Telegram Webhook
+
+```bash
+TOKEN="YOUR_TELEGRAM_BOT_TOKEN"
+API_URL="https://abc123.execute-api.eu-central-1.amazonaws.com/bot"  # use the stack output
+SECRET="a-long-random-secret"  # must match what you passed at deploy
+
+curl -X POST "https://api.telegram.org/bot$TOKEN/setWebhook" \
+  -d "url=$API_URL" \
+  -d "secret_token=$SECRET"
+
+# verify
+curl -s "https://api.telegram.org/bot$TOKEN/getWebhookInfo" | jq
+```
+
+You should see `"url": "<API_URL>"` and no recent errors.
+
+---
+
+## Test
+
+In Telegram, open your bot (@YourBotName) and try:
+
+- `/ping` → `pong 🏓`
+- `/start` → greeting
+- Any text → echoed back
+
+Tail logs while testing:
+
+```bash
+aws logs tail /aws/lambda/<YourFunctionName> --follow
+```
+
+---
+
+## Troubleshooting
+
+- **WebHook 500** in `getWebhookInfo`:
+  - Check **CloudWatch Logs** for stack traces.
+  - Ensure Lambda env vars: `TELEGRAM_TOKEN`, `WEBHOOK_SECRET_TOKEN` (if you set a secret).
+  - Ensure handler path is `lambda_function.lambda_handler`.
+
+- **No module named 'telegram'** or other dependency errors:
+  - Make sure Docker is installed and running locally (`docker --version`).
+  - CDK uses Docker to bundle dependencies during deployment.
+  - Rerun `cdk deploy` to rebuild the Lambda package.
+
+- **Secret mismatch**:
+  - The header `X-Telegram-Bot-Api-Secret-Token` must equal `WEBHOOK_SECRET_TOKEN` in Lambda env.
+  - Re-run `setWebhook` with the same secret you deploy.
+
+---
+
+## Teardown (avoid costs)
+
+Disable the webhook and destroy stacks:
+
+```bash
+TOKEN="YOUR_TELEGRAM_BOT_TOKEN"
+curl -X POST "https://api.telegram.org/bot$TOKEN/deleteWebhook"
+
+cdk destroy KinethosBotStack-dev -c stage=dev
+cdk destroy KinethosCdkStack-dev -c stage=dev
+```
+
+Optional cleanup:
+- Delete any Secrets Manager/SSM secrets if you used them.
+
+---
+
+## Next Steps
+
+- Add Bedrock calls in a separate Lambda (same stack or another stack).
+- Store user state in DynamoDB (chat_id, last command, preferences).
+- Add alarms (Lambda errors, 5XX on API Gateway) and log retention.

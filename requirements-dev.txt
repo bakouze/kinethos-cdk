@@ -1,1 +1,13 @@
-pytest==6.2.5
+aws-cdk-lib==2.211.0
+constructs>=10.0.0,<11.0.0
+
+# API Gateway v2 (HTTP API) alpha modules for Lambda integrations
+aws-cdk.aws-apigatewayv2-alpha==2.114.1a0
+aws-cdk.aws-apigatewayv2-integrations-alpha==2.114.1a0
+
+# AWS SDK (useful in Lambda and for local scripts)
+boto3>=1.34.0
+
+# For the Telegram bot Lambda
+python-telegram-bot==21.*
+python-dotenv>=1.0.1
