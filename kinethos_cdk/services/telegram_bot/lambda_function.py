@@ -16,6 +16,19 @@ from telegram.ext import (
     filters,
 )
 
+# --- Bedrock config via env vars ---
+BEDROCK_MODEL_ID = os.getenv(
+    "BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20240620-v1:0"
+)
+BEDROCK_REGION = os.getenv("BEDROCK_REGION", "eu-central-1")
+BEDROCK_MAX_TOKENS = int(os.getenv("BEDROCK_MAX_TOKENS", "512"))
+BEDROCK_TEMPERATURE = float(os.getenv("BEDROCK_TEMPERATURE", "0.2"))
+BEDROCK_SYSTEM_PROMPT = os.getenv(
+    "BEDROCK_SYSTEM_PROMPT", "You are a expert sport and nutrition coach."
+)
+
+brt = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -29,9 +42,44 @@ FIREHOSE_STREAM = os.getenv("FIREHOSE_STREAM_NAME")
 DDB_TABLE = os.getenv("DDB_TABLE_NAME")
 
 
+# ---------- Bedrock handler ----------
+def call_bedrock_anthropic(prompt: str) -> str:
+    """
+    Calls Anthropic Claude on Bedrock using the Messages API style request.
+    Adjust if you choose a different provider (Cohere, Llama, etc.).
+    """
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": BEDROCK_MAX_TOKENS,
+        "temperature": BEDROCK_TEMPERATURE,
+        "system": BEDROCK_SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+    }
+
+    resp = brt.invoke_model(
+        modelId=BEDROCK_MODEL_ID,
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps(body),
+    )
+    payload = json.loads(resp["body"].read())
+
+    # Extract text from Anthropic response
+    # payload format: {'id':..., 'content':[{'type':'text','text':'...'}], ...}
+    parts = payload.get("content", [])
+    texts = [
+        p.get("text", "")
+        for p in parts
+        if isinstance(p, dict) and p.get("type") == "text"
+    ]
+    return "\n".join(t for t in texts if t)
+
+
 # ---------- PTB handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 KinethosBot (Lambda webhook). Try /ping or say hi.")
+    await update.message.reply_text(
+        "👋 KinethosBot (Lambda webhook). Try /ping or say hi."
+    )
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -40,6 +88,39 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Echo: {update.message.text or ''}")
+
+
+async def ai_coach(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+
+    # 1) prefer argument after /ai-test
+    args_text = " ".join(context.args).strip() if context.args else ""
+
+    # 2) or, if the user replied to a message, use that text
+    if not args_text and update.message and update.message.reply_to_message:
+        args_text = (update.message.reply_to_message.text or "").strip()
+
+    if not args_text:
+        await chat.send_message(
+            "Usage:\n"
+            "/ai-test <your text>\n\n"
+            "Tip: you can also reply to any message with /ai-test and I’ll use that text."
+        )
+        return
+
+    # 3) acknowledge quickly
+    await chat.send_message("🤖 Running your prompt through Bedrock…")
+
+    try:
+        answer = call_bedrock_anthropic(args_text)
+        if not answer:
+            answer = "_(Model returned no text)_"
+        await _send_chunked(chat, answer)
+    except Exception as e:
+        logging.exception("Bedrock call failed")
+        await chat.send_message(
+            "Sorry, I couldn’t reach Bedrock or parse the response. Check logs."
+        )
 
 
 # ---------- PTB app lifecycle ----------
@@ -52,6 +133,7 @@ def _build_app() -> Application:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("ping", ping))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+    application.add_handler(CommandHandler("ai_coach", ai_coach))
     return application
 
 
@@ -66,6 +148,7 @@ async def _ensure_initialized() -> Application:
         _initialized = True
         logger.info("PTB Application initialized")
     return _app
+
 
 # ---------- Helpers ----------
 def _extract_ids(update_json: dict) -> Tuple[Optional[int], int]:
@@ -89,16 +172,15 @@ def _extract_ids(update_json: dict) -> Tuple[Optional[int], int]:
             chat_id = cq["message"]["chat"].get("id")
     return chat_id, now_ms
 
+
 def _put_firehose(update_json: dict):
     """Put the update into Firehose."""
     logger.info("Putting update into Firehose")
     if not FIREHOSE_STREAM:
         return
     data = (json.dumps(update_json, separators=(",", ":")) + "\n").encode("utf-8")
-    _firehose.put_record(
-        DeliveryStreamName=FIREHOSE_STREAM,
-        Record={"Data": data}
-    )
+    _firehose.put_record(DeliveryStreamName=FIREHOSE_STREAM, Record={"Data": data})
+
 
 def _put_dynamo(update_json: dict):
     """Put the update into DynamoDB."""
@@ -115,7 +197,9 @@ def _put_dynamo(update_json: dict):
     item = {
         "pk": {"S": pk},
         "sk": {"S": sk},
-        "update_id": {"N": str(update_id)} if isinstance(update_id, int) else {"S": str(update_id)},
+        "update_id": {"N": str(update_id)}
+        if isinstance(update_id, int)
+        else {"S": str(update_id)},
         "payload": {"S": json.dumps(update_json, separators=(",", ":"))},
         "expire_at": {"N": str(expire_at)},
     }
@@ -124,14 +208,23 @@ def _put_dynamo(update_json: dict):
     item["gsi1sk"] = {"S": pk}
 
     _dynamodb.put_item(TableName=DDB_TABLE, Item=item)
-    
+
+
+async def _send_chunked(chat, text: str):
+    MAX = 4096
+    for i in range(0, len(text), MAX):
+        await chat.send_message(text[i : i + MAX])
+
+
 # ---------- Lambda entry ----------
 def lambda_handler(event, context):
     # 1) Verify secret header if configured
     expected = os.getenv("WEBHOOK_SECRET_TOKEN")
     if expected:
         headers = event.get("headers") or {}
-        supplied = headers.get("X-Telegram-Bot-Api-Secret-Token") or headers.get("x-telegram-bot-api-secret-token")
+        supplied = headers.get("X-Telegram-Bot-Api-Secret-Token") or headers.get(
+            "x-telegram-bot-api-secret-token"
+        )
         if supplied != expected:
             logger.warning("Secret token mismatch")
             return {"statusCode": 401, "body": "unauthorized"}
@@ -148,7 +241,7 @@ def lambda_handler(event, context):
     except Exception as e:
         logger.exception("Failed to parse request body as JSON" + e)
         return {"statusCode": 400, "body": "invalid body"}
-    
+
     # 3) Dual-write BEFORE bot logic (so we capture even if bot handler fails)
     try:
         _put_firehose(update_json)
