@@ -7,12 +7,13 @@ import time
 from typing import Optional, Tuple
 import boto3
 
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
+    ConversationHandler,
     filters,
 )
 
@@ -40,6 +41,42 @@ _dynamodb = boto3.client("dynamodb")
 
 FIREHOSE_STREAM = os.getenv("FIREHOSE_STREAM_NAME")
 DDB_TABLE = os.getenv("DDB_TABLE_NAME")
+
+# ---------- Onboarding conversation states ----------
+(
+    GOAL,
+    EVENT,
+    TIME_AVAIL,
+    TRAINING_DAYS,
+    CURR_TRAIN,
+    EXPERIENCE,
+    INJURIES,
+    PREFS,
+    DONE,
+) = range(9)
+
+
+def _save_user_profile(user_id: int, data: dict):
+    """
+    Persist the onboarding answers into DynamoDB as a compact user profile.
+    Uses the same table but a different PK/SK than raw updates.
+    """
+    if not DDB_TABLE:
+        logger.warning("DDB_TABLE not set; skipping profile save")
+        return
+
+    item = {
+        "pk": {"S": f"USER#{user_id}"},
+        "sk": {"S": "PROFILE#v1"},
+        "updated_at": {"N": str(int(time.time()))},
+        "profile": {"S": json.dumps(data, separators=(",", ":"))},
+    }
+    _dynamodb.put_item(TableName=DDB_TABLE, Item=item)
+
+
+def _kb(options: list[list[str]]) -> ReplyKeyboardMarkup:
+    """Build a compact one-time reply keyboard from rows of strings."""
+    return ReplyKeyboardMarkup(options, resize_keyboard=True, one_time_keyboard=True)
 
 
 # ---------- Bedrock handler ----------
@@ -77,23 +114,105 @@ def call_bedrock_anthropic(prompt: str) -> str:
 
 # ---------- PTB handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # initialize onboarding dict
+    context.user_data["onb"] = {}
     await update.message.reply_text(
-        "👋 KinethosBot (Lambda webhook). Try /ping or say hi."
+        "👋 Welcome to Kinethos! I’ll ask a few quick questions to tailor your plan. "
+        "First up: what’s your main goal right now?\n"
+        "e.g., marathon, improve cycling endurance, get fitter, balance training with life."
     )
+    return GOAL
 
 
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong 🏓")
+async def ask_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["onb"]["goal"] = (update.message.text or "").strip()
+    kb = _kb([["Yes", "No"]])
+    await update.message.reply_text(
+        "Do you have a specific event or race in mind? If yes, please share the date and distance. "
+        "If not, just tap No.",
+        reply_markup=kb,
+    )
+    return EVENT
 
 
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Echo: {update.message.text or ''}")
+async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["onb"]["event"] = (update.message.text or "").strip()
+    await update.message.reply_text(
+        "How many hours do you realistically have for training each week? ",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return TIME_AVAIL
+
+
+async def ask_training_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["onb"]["event"] = (update.message.text or "").strip()
+    await update.message.reply_text("On which day do you want to train each week? ")
+    return TRAINING_DAYS
+
+
+async def ask_curr_train(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["onb"]["time_available"] = (update.message.text or "").strip()
+    await update.message.reply_text(
+        "What does your current training look like?\n"
+        "For example: how often you run, cycle, do strength, or if you’re starting fresh.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return CURR_TRAIN
+
+
+async def ask_experience(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["onb"]["current_training"] = (update.message.text or "").strip()
+    kb = _kb([["Beginner", "Intermediate", "Advanced"]])
+    await update.message.reply_text(
+        "How experienced do you feel in endurance sports?",
+        reply_markup=kb,
+    )
+    return EXPERIENCE
+
+
+async def ask_injuries(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["onb"]["experience"] = (update.message.text or "").strip()
+    await update.message.reply_text(
+        "Do you have any injuries or physical limitations I should take into account?",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return INJURIES
+
+
+async def ask_prefs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["onb"]["injuries"] = (update.message.text or "").strip()
+    kb = _kb([["Running", "Cycling"], ["Strength", "Mix"]])
+    await update.message.reply_text(
+        "What type of training do you enjoy most?",
+        reply_markup=kb,
+    )
+    return PREFS
+
+
+async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["onb"]["preferences"] = (update.message.text or "").strip()
+    # Persist to DynamoDB
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is not None:
+        _save_user_profile(user_id, context.user_data["onb"])
+    await update.message.reply_text(
+        "Awesome — thank you! 🎉 I’ve saved your answers and will craft your first training plan next.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "No worries — we can set this up anytime. Just send /start to begin again."
+    )
+    return ConversationHandler.END
 
 
 async def ai_coach(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
 
-    # 1) prefer argument after /ai-test
+    # 1) prefer argument after /ai_coach
     args_text = " ".join(context.args).strip() if context.args else ""
 
     # 2) or, if the user replied to a message, use that text
@@ -103,8 +222,8 @@ async def ai_coach(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args_text:
         await chat.send_message(
             "Usage:\n"
-            "/ai-test <your text>\n\n"
-            "Tip: you can also reply to any message with /ai-test and I’ll use that text."
+            "/ai_coach <your text>\n\n"
+            "Tip: you can also reply to any message with /ai_coach and I’ll use that text."
         )
         return
 
@@ -116,7 +235,7 @@ async def ai_coach(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not answer:
             answer = "_(Model returned no text)_"
         await _send_chunked(chat, answer)
-    except Exception as e:
+    except Exception:
         logging.exception("Bedrock call failed")
         await chat.send_message(
             "Sorry, I couldn’t reach Bedrock or parse the response. Check logs."
@@ -130,9 +249,28 @@ def _build_app() -> Application:
         raise RuntimeError("Missing TELEGRAM_TOKEN env variable")
 
     application = Application.builder().token(token).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("ping", ping))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+    # Onboarding conversation
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_event)],
+            EVENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_time)],
+            TIME_AVAIL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_curr_train)
+            ],
+            CURR_TRAIN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_experience)
+            ],
+            EXPERIENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_injuries)],
+            INJURIES: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_prefs)],
+            PREFS: [MessageHandler(filters.TEXT & ~filters.COMMAND, finish_onboarding)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        conversation_timeout=600,  # 10 minutes of inactivity
+    )
+    application.add_handler(conv)
+
     application.add_handler(CommandHandler("ai_coach", ai_coach))
     return application
 
@@ -211,9 +349,9 @@ def _put_dynamo(update_json: dict):
 
 
 async def _send_chunked(chat, text: str):
-    MAX = 4096
-    for i in range(0, len(text), MAX):
-        await chat.send_message(text[i : i + MAX])
+    max_len = 4096
+    for i in range(0, len(text), max_len):
+        await chat.send_message(text[i : i + max_len])
 
 
 # ---------- Lambda entry ----------
