@@ -145,13 +145,13 @@ async def ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ask_training_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["onb"]["event"] = (update.message.text or "").strip()
-    await update.message.reply_text("On which day do you want to train each week? ")
+    context.user_data["onb"]["time_available"] = (update.message.text or "").strip()
+    await update.message.reply_text("On which days do you want to train each week? ")
     return TRAINING_DAYS
 
 
 async def ask_curr_train(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["onb"]["time_available"] = (update.message.text or "").strip()
+    context.user_data["onb"]["training_days"] = (update.message.text or "").strip()
     await update.message.reply_text(
         "What does your current training look like?\n"
         "For example: how often you run, cycle, do strength, or if you’re starting fresh.",
@@ -257,6 +257,9 @@ def _build_app() -> Application:
             GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_event)],
             EVENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_time)],
             TIME_AVAIL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_training_days)
+            ],
+            TRAINING_DAYS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_curr_train)
             ],
             CURR_TRAIN: [
@@ -377,7 +380,7 @@ def lambda_handler(event, context):
     try:
         update_json = json.loads(body)
     except Exception as e:
-        logger.exception("Failed to parse request body as JSON" + e)
+        logger.exception("Failed to parse request body as JSON: %s", e)
         return {"statusCode": 400, "body": "invalid body"}
 
     # 3) Dual-write BEFORE bot logic (so we capture even if bot handler fails)

@@ -4,10 +4,10 @@ from typing import Dict, Optional
 from aws_cdk import Duration
 from constructs import Construct
 
-from aws_cdk.aws_apigatewayv2_alpha import (
+from aws_cdk.aws_apigatewayv2 import (
     HttpApi, HttpMethod, CorsPreflightOptions, CorsHttpMethod
 )
-from aws_cdk.aws_apigatewayv2_integrations_alpha import HttpLambdaIntegration
+from aws_cdk.aws_apigatewayv2_integrations import HttpLambdaIntegration
 
 # NEW import:
 from aws_cdk.aws_lambda_python_alpha import PythonFunction
